@@ -426,6 +426,13 @@ def launch(game):
                          start_new_session=True)
 
 def main():
+    # MiSTer launches Scripts-menu entries pinned to core 1 via taskset;
+    # widen our affinity to both cores so minicast (and children) get core 0+1.
+    try:
+        os.sched_setaffinity(0, {0, 1})
+    except OSError:
+        pass
+
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     game = curses.wrapper(ui)
     if game is not None:
