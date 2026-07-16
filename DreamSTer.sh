@@ -270,7 +270,7 @@ def game_list_screen(scr, games):
     sel = 0
     top = 0
     while True:
-        draw_title(scr, "%d game(s) found in %s" % (len(games), DC_DIR))
+        draw_title(scr, "%d game(s) found in %s" % (len(games) - 1, DC_DIR))
         h, w = scr.getmaxyx()
         list_top = 4
         list_h = max(1, h - list_top - 2)
@@ -389,12 +389,15 @@ def ui(scr):
         error_screen(scr, ["ERROR: no games (.cdi/.cue/.gdi) found in",
                            DC_DIR])
         return None
+    games.insert(0, ("Boot To Bios", "nodisk"))
 
     while True:
         game = game_list_screen(scr, games)
         if game is None:
             return None
-        if config_screen(scr, cfg, os.path.relpath(game, DC_DIR)):
+        subtitle = ("Boot To Bios" if game == "nodisk"
+                    else os.path.relpath(game, DC_DIR))
+        if config_screen(scr, cfg, subtitle):
             return game
 
 
