@@ -3,6 +3,11 @@
 
 Python 3.9 / curses. Scans gane dir for .cdi/.cue/.gdi images,
 lets the user tweak emu.cfg and launches minicast on the polly2-rtl bitstream.
+
+The MiSTer main binary is killed as soon as the script starts (so it stops
+eating input/video) and is ALWAYS restarted when the script exits, on every
+path. Menus navigate from the terminal keyboard (console tty or ssh pty) and
+from any configured evdev device: mapped dpad moves, A confirms, B cancels.
 """
 
 import configparser
@@ -425,6 +430,20 @@ TARGETS = [
     ("trig_r", "Trigger Right (0..255)"),
 ]
 
+# capture prompts name the direction to actuate. For the analog axes the
+# prompted direction is the NEGATIVE end of the DC axis (left/up negative),
+# so an axis capture flips the detected sign to point the mapping there and
+# a key capture becomes the negative keypair half (positive asked second).
+CAPTURE_PROMPTS = {
+    "dpad_up": "Move Up",
+    "dpad_down": "Move Down",
+    "dpad_left": "Move Left",
+    "dpad_right": "Move Right",
+    "analog_x": "Move Left",
+    "analog_y": "Move Up",
+}
+ANALOG_POS_PROMPTS = {"analog_x": "Move Right", "analog_y": "Move Down"}
+
 # emu.cfg key per target, in file order
 TARGET_CFG_KEYS = [
     ("dpad_up", "DpadUp"),
@@ -500,17 +519,7 @@ DEFAULTS = {
 
 
 def default_config(dev):
-    cfg = DEFAULTS.get(dev.kind, {})
-    if dev.kind == "mouse" and not dev.has_rel and \
-            0 in dev.abs_codes and 1 in dev.abs_codes:
-        # absolute pointer: ABS_X/ABS_Y motion drives the analog stick
-        # as deltas, not position
-        cfg = dict(cfg)
-        cfg["analog_x"] = {"kind": "abs", "code": 0, "dir": 1,
-                           "mode": "delta"}
-        cfg["analog_y"] = {"kind": "abs", "code": 1, "dir": 1,
-                           "mode": "delta"}
-    return cfg
+    return DEFAULTS.get(dev.kind, {})
 
 
 def effective_config(dev):
@@ -529,10 +538,7 @@ def mapping_text(m):
         pos = key_name(m["pos"]) if m["pos"] is not None else "-"
         return "%s / %s" % (neg, pos)
     if m["kind"] == "abs":
-        text = "%s %s" % (abs_name(m["code"]), "+" if m["dir"] > 0 else "-")
-        if m.get("mode") == "delta":
-            text += " (delta)"
-        return text
+        return "%s %s" % (abs_name(m["code"]), "+" if m["dir"] > 0 else "-")
     return "%s %s" % (rel_name(m["code"]), "+" if m["dir"] > 0 else "-")
 
 
@@ -540,7 +546,6 @@ def mapping_text(m):
 #   key:<code>              button/key press
 #   keys:<neg>:<pos>        key pair driving an axis (-1 = unset)
 #   abs:<code>:<dir>        absolute axis, dir 1 or -1
-#   absdelta:<code>:<dir>   absolute axis, delta-encoded (pointer motion)
 #   rel:<code>:<dir>        relative axis (mouse motion)
 
 def encode_mapping(m):
@@ -550,8 +555,7 @@ def encode_mapping(m):
         return "keys:%d:%d" % (m["neg"] if m["neg"] is not None else -1,
                                m["pos"] if m["pos"] is not None else -1)
     if m["kind"] == "abs":
-        kind = "absdelta" if m.get("mode") == "delta" else "abs"
-        return "%s:%d:%d" % (kind, m["code"], m["dir"])
+        return "abs:%d:%d" % (m["code"], m["dir"])
     return "rel:%d:%d" % (m["code"], m["dir"])
 
 
@@ -565,12 +569,9 @@ def decode_mapping(text):
             return {"kind": "keypair",
                     "neg": neg if neg >= 0 else None,
                     "pos": pos if pos >= 0 else None}
-        if parts[0] in ("abs", "absdelta") and len(parts) == 3:
-            m = {"kind": "abs", "code": int(parts[1]),
-                 "dir": 1 if int(parts[2]) >= 0 else -1}
-            if parts[0] == "absdelta":
-                m["mode"] = "delta"
-            return m
+        if parts[0] == "abs" and len(parts) == 3:
+            return {"kind": "abs", "code": int(parts[1]),
+                    "dir": 1 if int(parts[2]) >= 0 else -1}
         if parts[0] == "rel" and len(parts) == 3:
             return {"kind": "rel", "code": int(parts[1]),
                     "dir": 1 if int(parts[2]) >= 0 else -1}
@@ -719,7 +720,6 @@ class DCState:
     """Applies a device's mappings to its events -> Dreamcast pad state."""
 
     REL_GAIN = 4.0        # mouse counts -> analog deflection
-    ABS_DELTA_GAIN = 512  # fraction-of-range moved -> analog deflection
 
     def __init__(self, dev, fd):
         self.dev = dev
@@ -735,8 +735,7 @@ class DCState:
         self.analog = {"analog_x": 0, "analog_y": 0}
         self.trig = {"trig_l": 0, "trig_r": 0}
         self.kp = {}          # keypair target -> [neg held, pos held]
-        self.rel_accum = {}   # delta-driven analog target -> float
-        self.abs_last = {}    # abs code -> last value (delta mode)
+        self.rel_accum = {}   # rel-driven analog target -> float
         self.by_key = {}
         self.by_abs = {}
         self.by_rel = {}
@@ -750,8 +749,6 @@ class DCState:
                     self.by_key.setdefault(m["pos"], []).append((target, 1))
             elif m["kind"] == "abs":
                 self.by_abs.setdefault(m["code"], []).append((target, m))
-                if m.get("mode") == "delta":
-                    self.rel_accum[target] = 0.0
             elif m["kind"] == "rel":
                 self.by_rel.setdefault(m["code"], []).append((target, m))
                 self.rel_accum[target] = 0.0
@@ -778,18 +775,6 @@ class DCState:
                     lo, hi = self.absrange.get(code, (-32768, 32767))
                 if hi <= lo:
                     continue
-                if target in self.analog and m.get("mode") == "delta":
-                    last = self.abs_last.get(code)
-                    self.abs_last[code] = value
-                    if last is None:
-                        continue
-                    delta = value - last
-                    if abs(delta) > (hi - lo) * 0.3:
-                        continue  # touch lift/re-position jump, not motion
-                    self.rel_accum[target] += (delta / float(hi - lo)
-                                               * self.ABS_DELTA_GAIN
-                                               * m["dir"])
-                    continue
                 norm = (value - lo) / float(hi - lo) * 2.0 - 1.0  # -1..1
                 if m["dir"] < 0:
                     norm = -norm
@@ -815,6 +800,130 @@ class DCState:
             acc = self.rel_accum[target]
             self.analog[target] = max(-127, min(127, int(acc)))
             self.rel_accum[target] = acc * 0.8 if abs(acc) >= 1.0 else 0.0
+
+
+# --------------------------------------------------------- evdev menu nav ---
+# Menu navigation from configured evdev devices: the mapped dpad moves the
+# cursor, A confirms (ENTER), B cancels (ESC). Keyboard-kind devices are
+# deliberately NOT read here: their input already arrives through the
+# terminal (console tty locally, pty over ssh), so reading them from evdev
+# too would process every key twice. Gamepads/mice produce no tty input, so
+# evdev is their only path - no double handling either way, and no exclusive
+# grabs needed (MiSTer, the other evdev reader, is killed on script entry).
+
+NAV_KEYS = {
+    "dpad_up": curses.KEY_UP,
+    "dpad_down": curses.KEY_DOWN,
+    "dpad_left": curses.KEY_LEFT,
+    "dpad_right": curses.KEY_RIGHT,
+    "btn_a": 10,        # confirm / enter
+    "btn_b": KEY_ESC,   # cancel / back
+}
+NAV_REPEAT = ("dpad_up", "dpad_down", "dpad_left", "dpad_right")
+NAV_REPEAT_DELAY = 0.40
+NAV_REPEAT_RATE = 0.11
+
+
+class NavPump:
+    """Translates mapped dpad/A/B presses on non-keyboard evdevs into keys."""
+
+    def __init__(self):
+        self.states = {}  # fd -> DCState
+        self.queue = []   # pending key codes
+        self.held = {}    # (fd, target) -> next auto-repeat time
+        for dev in scan_devices():
+            if dev.kind == "keyboard":
+                continue
+            if not any(t in effective_config(dev) for t in NAV_KEYS):
+                continue
+            try:
+                fd = os.open(dev.path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                continue
+            drain(fd)
+            self.states[fd] = DCState(dev, fd)
+
+    def close(self):
+        for fd in self.states:
+            os.close(fd)
+        self.states = {}
+        self.queue = []
+        self.held = {}
+
+    def fds(self):
+        return list(self.states)
+
+    def pump(self):
+        now = time.monotonic()
+        for fd in list(self.states):
+            st = self.states[fd]
+            evs = read_events(fd)
+            if evs is None:  # device unplugged
+                os.close(fd)
+                del self.states[fd]
+                continue
+            if not evs:
+                continue
+            before = set(st.buttons)
+            for etype, code, value in evs:
+                st.feed(etype, code, value)
+            for target in st.buttons - before:
+                if target in NAV_KEYS:
+                    self.queue.append(NAV_KEYS[target])
+                    if target in NAV_REPEAT:
+                        self.held[(fd, target)] = now + NAV_REPEAT_DELAY
+        for key in list(self.held):
+            fd, target = key
+            st = self.states.get(fd)
+            if st is None or target not in st.buttons:
+                del self.held[key]
+            elif now >= self.held[key]:
+                self.queue.append(NAV_KEYS[target])
+                self.held[key] = now + NAV_REPEAT_RATE
+
+    def next_key(self):
+        self.pump()
+        if self.queue:
+            return self.queue.pop(0)
+        return None
+
+    def flush(self):
+        """Discards pending nav input (after test/capture screens, where the
+        same physical presses were consumed by a different reader)."""
+        self.pump()
+        self.queue = []
+        self.held = {}
+
+
+NAV = [None]  # active NavPump; rebuilt when mappings change
+
+
+def nav_flush():
+    if NAV[0] is not None:
+        NAV[0].flush()
+
+
+def nav_getch(scr):
+    """Blocking scr.getch() that also accepts evdev navigation input."""
+    nav = NAV[0]
+    while True:
+        if nav is not None:
+            ch = nav.next_key()
+            if ch is not None:
+                return ch
+        rl = [0] + (nav.fds() if nav else [])
+        timeout = 0.05 if (nav and nav.held) else 1.0
+        try:
+            r, _, _ = select.select(rl, [], [], timeout)
+        except OSError:
+            r = []
+        # 60ms window lets terminal escape sequences complete; a plain poll
+        # (timeout 0) otherwise, which also harvests pending KEY_RESIZE
+        scr.timeout(60 if 0 in r else 0)
+        ch = scr.getch()
+        scr.timeout(-1)
+        if ch != -1:
+            return ch
 
 
 def draw_tokens(scr, y, x, tokens):
@@ -844,6 +953,7 @@ def test_screen(scr, devices, subtitle):
         states[fd] = DCState(dev, fd)
     scr.nodelay(True)
     top = 0
+    b_hold = {}  # fd -> monotonic time btn_b went down (hold B to exit)
     try:
         while True:
             ch = scr.getch()
@@ -861,6 +971,7 @@ def test_screen(scr, devices, subtitle):
                         os.close(fd)
                         del states[fd]
                         del fds[fd]
+                        b_hold.pop(fd, None)
                         continue
                     for etype, code, value in evs:
                         states[fd].feed(etype, code, value)
@@ -868,6 +979,15 @@ def test_screen(scr, devices, subtitle):
                 time.sleep(0.05)
             for st in states.values():
                 st.tick()
+
+            # a B tap is just being tested; holding it 1.5s means "back"
+            now = time.monotonic()
+            for fd, st in states.items():
+                if "btn_b" in st.buttons:
+                    if now - b_hold.setdefault(fd, now) >= 1.5:
+                        return
+                else:
+                    b_hold.pop(fd, None)
 
             draw_title(scr, subtitle)
             h, _ = scr.getmaxyx()
@@ -916,7 +1036,7 @@ def test_screen(scr, devices, subtitle):
                 yv += 2
             safe_addstr(scr, h - 1, 1,
                         "Press buttons / move axes   UP/DOWN: scroll   "
-                        "ESC: back", color(C_DIM))
+                        "ESC / hold B: back", color(C_DIM))
             scr.refresh()
     finally:
         scr.nodelay(False)
@@ -976,11 +1096,11 @@ def device_list_screen(scr, devices, cfg):
 
         if notice:
             safe_addstr(scr, h - 2, 1, notice, notice_attr)
-        footer = "UP/DOWN: select   ENTER: open   ESC: back"
+        footer = "UP/DOWN: select   ENTER/A: open   ESC/B: back"
         safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
         scr.refresh()
 
-        ch = scr.getch()
+        ch = nav_getch(scr)
         notice = ""
         if ch == curses.KEY_UP:
             sel = (sel - 1) % len(selectable)
@@ -1058,14 +1178,14 @@ def device_screen(scr, dev):
             else:
                 safe_addstr(scr, y, 4, text)
                 safe_addstr(scr, y, 6 + len(text) + 2, value, color(C_VALUE))
-        footer = "UP/DOWN: select   ENTER: map/activate   ESC: back"
+        footer = "UP/DOWN: select   ENTER/A: map/activate   ESC/B: back"
         safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
 
     while True:
         draw()
         scr.refresh()
 
-        ch = scr.getch()
+        ch = nav_getch(scr)
         if ch == curses.KEY_UP:
             sel = (sel - 1) % len(selectable)
         elif ch == curses.KEY_DOWN:
@@ -1079,34 +1199,39 @@ def device_screen(scr, dev):
                 return
             if row[0] == "test":
                 test_screen(scr, [dev], "Testing: %s" % dev.name)
+                nav_flush()
             elif row[0] == "remove":
                 # explicit empty config: overrides the per-kind defaults
                 CONFIG[dev.id] = {}
             else:  # map
+                target = row[1]
                 m = capture_mapping(
                     scr, dev,
-                    lambda text: draw(capture_idx=idx, capture_text=text))
+                    lambda text: draw(capture_idx=idx, capture_text=text),
+                    prompt=CAPTURE_PROMPTS.get(target, "Waiting"))
                 if m is not None:
-                    if (row[1] in ("analog_x", "analog_y")
-                            and m["kind"] == "abs"
-                            and dev.kind == "mouse"):
-                        # pointer position drives the stick as deltas
-                        m["mode"] = "delta"
-                    if (row[1] in ("analog_x", "analog_y")
-                            and m["kind"] == "key"):
-                        # a key drives half an axis; ask for the + direction
-                        m2 = capture_mapping(
-                            scr, dev,
-                            lambda text: draw(capture_idx=idx,
-                                              capture_text=text),
-                            prompt="Press + direction")
-                        pos = (m2["code"]
-                               if m2 is not None and m2["kind"] == "key"
-                               else None)
-                        m = {"kind": "keypair", "neg": m["code"], "pos": pos}
+                    if target in ANALOG_POS_PROMPTS:
+                        if m["kind"] == "key":
+                            # that key is the negative (left/up) half of the
+                            # axis; now capture the positive one
+                            m2 = capture_mapping(
+                                scr, dev,
+                                lambda text: draw(capture_idx=idx,
+                                                  capture_text=text),
+                                prompt=ANALOG_POS_PROMPTS[target])
+                            pos = (m2["code"]
+                                   if m2 is not None and m2["kind"] == "key"
+                                   else None)
+                            m = {"kind": "keypair", "neg": m["code"],
+                                 "pos": pos}
+                        else:
+                            # the prompted move (left/up) is the negative end
+                            # of the DC axis: point the mapping the other way
+                            m["dir"] = -m["dir"]
                     if dev.id not in CONFIG:
                         CONFIG[dev.id] = dict(effective_config(dev))
-                    CONFIG[dev.id][row[1]] = m
+                    CONFIG[dev.id][target] = m
+                nav_flush()  # the captured press also landed in the nav fds
 
 
 def input_mapper(scr, cfg):
@@ -1119,6 +1244,7 @@ def input_mapper(scr, cfg):
         kind, dev = res
         if kind == "test":
             test_screen(scr, devices, "Testing all devices")
+            nav_flush()
         else:
             device_screen(scr, dev)
 
@@ -1231,11 +1357,11 @@ def main_menu_screen(scr, games):
             else:
                 safe_addstr(scr, y, 4, text)
 
-        footer = "UP/DOWN: select   ENTER: configure & launch   ESC: exit"
+        footer = "UP/DOWN: select   ENTER/A: configure & launch   ESC/B: exit"
         safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
         scr.refresh()
 
-        ch = scr.getch()
+        ch = nav_getch(scr)
         if ch == curses.KEY_UP:
             sel = (sel - 1) % len(selectable)
         elif ch == curses.KEY_DOWN:
@@ -1310,11 +1436,11 @@ def config_screen(scr, cfg, game_rel):
                     put(yv, 6, label)
                     put(yv, 6 + len(label) + 2, value, color(C_VALUE))
 
-        footer = "UP/DOWN: select   LEFT/RIGHT/ENTER: change   ESC: back"
+        footer = "UP/DOWN: select   LEFT/RIGHT/ENTER/A: change   ESC/B: back"
         safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
         scr.refresh()
 
-        ch = scr.getch()
+        ch = nav_getch(scr)
         row = rows[selectable[sel]]
         if ch == curses.KEY_UP:
             sel = (sel - 1) % len(selectable)
@@ -1351,18 +1477,25 @@ def ui(scr):
 
     games = scan_games()
 
-    while True:
-        res = main_menu_screen(scr, games)
-        if res is None:
-            return None
-        if res[0] == "inputmap":
-            input_mapper(scr, cfg)
-            continue
-        game = "nodisk" if res[0] == "bios" else res[1]
-        subtitle = ("Boot To Bios" if game == "nodisk"
-                    else os.path.relpath(game, DC_DIR))
-        if config_screen(scr, cfg, subtitle):
-            return game
+    NAV[0] = NavPump()
+    try:
+        while True:
+            res = main_menu_screen(scr, games)
+            if res is None:
+                return None
+            if res[0] == "inputmap":
+                input_mapper(scr, cfg)
+                NAV[0].close()
+                NAV[0] = NavPump()  # mappings may have changed
+                continue
+            game = "nodisk" if res[0] == "bios" else res[1]
+            subtitle = ("Boot To Bios" if game == "nodisk"
+                        else os.path.relpath(game, DC_DIR))
+            if config_screen(scr, cfg, subtitle):
+                return game
+    finally:
+        NAV[0].close()
+        NAV[0] = None
 
 
 # ---------------------------------------------------------------- launch ---
@@ -1373,24 +1506,42 @@ def run(cmd, **kw):
     return subprocess.call(cmd, **kw)
 
 
+def kill_mister():
+    """Stops the MiSTer main binary so it releases input/video/audio."""
+    subprocess.call(["killall", "MiSTer"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(20):  # wait up to 2s for it to actually go away
+        if subprocess.call(["pidof", "MiSTer"], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL) != 0:
+            return
+        time.sleep(0.1)
+
+
+def restart_mister():
+    """Reloads the menu core and brings the MiSTer main binary back up."""
+    print("\nrestarting MiSTer...")
+    try:
+        run([LOAD_BITSTREAM, MENU_RBF], cwd=MINICAST_DIR)
+    except OSError as e:
+        print("menu core reload failed: %s" % e)
+    try:
+        with open(os.devnull, "rb+") as devnull:
+            subprocess.Popen([MISTER_BIN], cwd=os.path.dirname(MISTER_BIN),
+                             stdin=devnull, stdout=devnull, stderr=devnull,
+                             start_new_session=True)
+    except OSError as e:
+        print("MiSTer restart failed: %s" % e)
+
+
 def launch(game):
     print("\n=== %s ===" % TITLE)
     print("Launching: %s\n" % game)
-
-    subprocess.call(["killall", "MiSTer"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     run(["insmod", MEM_WC], cwd=MINICAST_DIR)
     run([LOAD_BITSTREAM, BITSTREAM_RBF], cwd=MINICAST_DIR)
     run([SETUP_HDMI], cwd=MINICAST_DIR)
     run([MINICAST_ELF, game], cwd=MINICAST_DIR)
 
-    print("\nminicast exited, restarting MiSTer...")
-    run([LOAD_BITSTREAM, MENU_RBF], cwd=MINICAST_DIR)
-    with open(os.devnull, "rb+") as devnull:
-    	subprocess.Popen([MISTER_BIN], cwd=os.path.dirname(MISTER_BIN),
-                         stdin=devnull, stdout=devnull, stderr=devnull,
-                         start_new_session=True)
 
 def main():
     # MiSTer launches Scripts-menu entries pinned to core 1 via taskset;
@@ -1401,9 +1552,17 @@ def main():
         pass
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    game = curses.wrapper(ui)
-    if game is not None:
-        launch(game)
+
+    # Take the box over up front: with MiSTer gone the console keyboard only
+    # reaches us through the tty and gamepads are free for the nav pump.
+    # Whatever happens after this point, MiSTer comes back on exit.
+    kill_mister()
+    try:
+        game = curses.wrapper(ui)
+        if game is not None:
+            launch(game)
+    finally:
+        restart_mister()
 
 
 if __name__ == "__main__":
