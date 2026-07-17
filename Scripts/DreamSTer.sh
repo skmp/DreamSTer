@@ -145,6 +145,40 @@ class Option:
         cfg.set("config", self.key, self.choices[idx][0])
 
 
+class AudioOption(Option):
+    """Audio mode: [config] aica.LimitFPS + [audio] disable together.
+
+    Synced   = LimitFPS yes, disable 0  (audio FIFO paces the emu)
+    Unsynced = LimitFPS no,  disable 0  (drop samples rather than wait)
+    Off      = disable 1                (LimitFPS left as-is)
+
+    Values match the DEFAULT_CFG template: aica.LimitFPS is yes/no,
+    [audio] disable is 0/1.
+    """
+
+    def __init__(self):
+        Option.__init__(self, "Audio", "aica.LimitFPS",
+                        [("synced", "Synced"), ("unsynced", "Unsynced"),
+                         ("off", "Off")], "synced")
+
+    def current(self, cfg):
+        if cfg.get("audio", "disable", fallback="0").strip() == "1":
+            return "off"
+        v = cfg.get("config", self.key, fallback="yes").strip().lower()
+        return "synced" if v in ("yes", "true", "on", "1") else "unsynced"
+
+    def cycle(self, cfg, direction):
+        val = self.current(cfg)
+        idx = next(i for i, (v, _) in enumerate(self.choices) if v == val)
+        val = self.choices[(idx + direction) % len(self.choices)][0]
+        for section in ("audio", "config"):
+            if not cfg.has_section(section):
+                cfg.add_section(section)
+        cfg.set("audio", "disable", "1" if val == "off" else "0")
+        if val != "off":
+            cfg.set("config", self.key, "yes" if val == "synced" else "no")
+
+
 OPTION_GROUPS = [
     ("Console", [
         Option("Cable Mode", "Dreamcast.Cable",
@@ -158,6 +192,7 @@ OPTION_GROUPS = [
         Option("FPS Target", "pvr.FPSTarget",
                [("66", "60 FPS"), ("55", "50 FPS"),
                 ("33", "30 FPS"), ("28", "25 FPS")], "66"),
+        AudioOption(),
     ]),
     ("polly2", [
         Option("AutoReset", "polly2.AutoReset",
