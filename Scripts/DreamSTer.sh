@@ -843,10 +843,16 @@ def test_screen(scr, devices, subtitle):
         fds[fd] = dev
         states[fd] = DCState(dev, fd)
     scr.nodelay(True)
+    top = 0
     try:
         while True:
-            if scr.getch() == KEY_ESC:
+            ch = scr.getch()
+            if ch == KEY_ESC:
                 return
+            if ch == curses.KEY_UP:
+                top -= 1
+            elif ch == curses.KEY_DOWN:
+                top += 1
             if fds:
                 r, _, _ = select.select(list(fds), [], [], 0.05)
                 for fd in r:
@@ -865,41 +871,52 @@ def test_screen(scr, devices, subtitle):
 
             draw_title(scr, subtitle)
             h, _ = scr.getmaxyx()
-            y = 4
+            list_top = 4
+            list_h = max(1, h - list_top - 2)
+            total = sum(3 if not states[fd].cfg else 4 for fd in fds)
+            top = max(0, min(top, max(0, total - list_h)))
+
+            def put(yv, x, text, attr=0):
+                y = list_top + yv - top
+                if list_top <= y < list_top + list_h:
+                    safe_addstr(scr, y, x, text, attr)
+
+            yv = 0
             for fd, dev in list(fds.items()):
-                if y >= h - 3:
-                    break
                 st = states[fd]
-                safe_addstr(scr, y, 2, dev.name[:44], curses.A_BOLD)
-                safe_addstr(scr, y, 2 + min(44, len(dev.name)) + 2,
-                            "[%s]" % dev.id, color(C_DIM))
-                y += 1
+                put(yv, 2, dev.name[:44], curses.A_BOLD)
+                put(yv, 2 + min(44, len(dev.name)) + 2,
+                    "[%s]" % dev.id, color(C_DIM))
+                yv += 1
                 if not st.cfg:
-                    safe_addstr(scr, y, 4, "(no mappings)", color(C_DIM))
-                    y += 2
+                    put(yv, 4, "(no mappings)", color(C_DIM))
+                    yv += 2
                     continue
-                draw_tokens(scr, y, 4, [
-                    ("Dpad:", None),
-                    ("UP", "dpad_up" in st.buttons),
-                    ("DOWN", "dpad_down" in st.buttons),
-                    ("LEFT", "dpad_left" in st.buttons),
-                    ("RIGHT", "dpad_right" in st.buttons),
-                    ("  Buttons:", None),
-                    ("A", "btn_a" in st.buttons),
-                    ("B", "btn_b" in st.buttons),
-                    ("X", "btn_x" in st.buttons),
-                    ("Y", "btn_y" in st.buttons),
-                    ("START", "btn_start" in st.buttons),
-                ])
-                y += 1
-                safe_addstr(scr, y, 4,
-                            "Analog X:%+4d Y:%+4d    Trigger L:%3d R:%3d"
-                            % (st.analog["analog_x"], st.analog["analog_y"],
-                               st.trig["trig_l"], st.trig["trig_r"]),
-                            color(C_VALUE))
-                y += 2
+                y = list_top + yv - top
+                if list_top <= y < list_top + list_h:
+                    draw_tokens(scr, y, 4, [
+                        ("Dpad:", None),
+                        ("UP", "dpad_up" in st.buttons),
+                        ("DOWN", "dpad_down" in st.buttons),
+                        ("LEFT", "dpad_left" in st.buttons),
+                        ("RIGHT", "dpad_right" in st.buttons),
+                        ("  Buttons:", None),
+                        ("A", "btn_a" in st.buttons),
+                        ("B", "btn_b" in st.buttons),
+                        ("X", "btn_x" in st.buttons),
+                        ("Y", "btn_y" in st.buttons),
+                        ("START", "btn_start" in st.buttons),
+                    ])
+                yv += 1
+                put(yv, 4,
+                    "Analog X:%+4d Y:%+4d    Trigger L:%3d R:%3d"
+                    % (st.analog["analog_x"], st.analog["analog_y"],
+                       st.trig["trig_l"], st.trig["trig_r"]),
+                    color(C_VALUE))
+                yv += 2
             safe_addstr(scr, h - 1, 1,
-                        "Press buttons / move axes   ESC: back", color(C_DIM))
+                        "Press buttons / move axes   UP/DOWN: scroll   "
+                        "ESC: back", color(C_DIM))
             scr.refresh()
     finally:
         scr.nodelay(False)
@@ -931,6 +948,7 @@ def device_list_screen(scr, devices, cfg):
             top = cur
         if cur >= top + list_h:
             top = cur - list_h + 1
+        top = max(0, min(top, max(0, len(rows) - list_h)))
 
         for i in range(top, min(len(rows), top + list_h)):
             kind, payload = rows[i]
@@ -991,22 +1009,32 @@ def device_screen(scr, dev):
     rows += [("header", "Danger Zone"), ("remove",)]
     selectable = [i for i, r in enumerate(rows) if r[0] != "header"]
     sel = 0
+    top = 0
 
     def draw(capture_idx=None, capture_text=""):
+        nonlocal top
         draw_title(scr, dev.name)
         h, w = scr.getmaxyx()
         safe_addstr(scr, 3, 2, "ID:   %s" % dev.id, color(C_DIM))
         safe_addstr(scr, 4, 2, "Path: %s  (%s)" % (dev.path, dev.kind),
                     color(C_DIM))
-        y = 6
+        list_top = 6
+        list_h = max(1, h - list_top - 2)
+        cur = selectable[sel]
+        if cur < top:
+            top = cur
+        if cur >= top + list_h:
+            top = cur - list_h + 1
+        top = max(0, min(top, max(0, len(rows) - list_h)))
         mappings = effective_config(dev)
-        for i, row in enumerate(rows):
+        for i in range(top, min(len(rows), top + list_h)):
+            row = rows[i]
+            y = list_top + (i - top)
             is_sel = (selectable[sel] == i)
             if row[0] == "header":
                 if row[1]:
                     safe_addstr(scr, y, 2, "[ %s ]" % row[1],
                                 color(C_HEADER, curses.A_BOLD))
-                y += 1
                 continue
             if row[0] == "back":
                 text = "Back"
@@ -1030,7 +1058,6 @@ def device_screen(scr, dev):
             else:
                 safe_addstr(scr, y, 4, text)
                 safe_addstr(scr, y, 6 + len(text) + 2, value, color(C_VALUE))
-            y += 1
         footer = "UP/DOWN: select   ENTER: map/activate   ESC: back"
         safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
 
@@ -1183,6 +1210,7 @@ def main_menu_screen(scr, games):
             top = cur
         if cur >= top + list_h:
             top = cur - list_h + 1
+        top = max(0, min(top, max(0, len(rows) - list_h)))
 
         for i in range(top, min(len(rows), top + list_h)):
             kind, payload = rows[i]
@@ -1232,36 +1260,55 @@ def config_screen(scr, cfg, game_rel):
     selectable = [i for i, r in enumerate(rows) if r[0] != "header"]
     sel = 0  # index into selectable; 0 == Launch (default)
 
+    # headers take two lines (blank + text), everything else one
+    heights = [2 if r[0] == "header" else 1 for r in rows]
+    offsets = []
+    total = 0
+    for hh in heights:
+        offsets.append(total)
+        total += hh
+    top = 0
+
     while True:
         draw_title(scr, game_rel)
         h, w = scr.getmaxyx()
-        y = 4
+        list_top = 4
+        list_h = max(1, h - list_top - 2)
+        cur = selectable[sel]
+        if offsets[cur] < top:
+            top = offsets[cur]
+        if offsets[cur] + heights[cur] > top + list_h:
+            top = offsets[cur] + heights[cur] - list_h
+        top = max(0, min(top, max(0, total - list_h)))
+
+        def put(yv, x, text, attr=0):
+            y = list_top + yv - top
+            if list_top <= y < list_top + list_h:
+                safe_addstr(scr, y, x, text, attr)
+
         for i, row in enumerate(rows):
+            yv = offsets[i]
             is_sel = (selectable[sel] == i)
             if row[0] == "launch":
                 text = "  Launch  "
                 if is_sel:
-                    safe_addstr(scr, y, 4, ">" + text, color(C_SEL, curses.A_BOLD))
+                    put(yv, 4, ">" + text, color(C_SEL, curses.A_BOLD))
                 else:
-                    safe_addstr(scr, y, 5, text, curses.A_BOLD)
-                y += 1
+                    put(yv, 5, text, curses.A_BOLD)
             elif row[0] == "header":
-                y += 1
-                safe_addstr(scr, y, 2, "[ %s ]" % row[1],
-                            color(C_HEADER, curses.A_BOLD))
-                y += 1
+                put(yv + 1, 2, "[ %s ]" % row[1],
+                    color(C_HEADER, curses.A_BOLD))
             else:
                 opt = row[1]
                 label = "%-28s" % opt.label
                 value = "< %s >" % opt.display(cfg)
                 if is_sel:
-                    safe_addstr(scr, y, 4, "> " + label, color(C_SEL, curses.A_BOLD))
-                    safe_addstr(scr, y, 6 + len(label) + 2, value,
-                                color(C_SEL, curses.A_BOLD))
+                    put(yv, 4, "> " + label, color(C_SEL, curses.A_BOLD))
+                    put(yv, 6 + len(label) + 2, value,
+                        color(C_SEL, curses.A_BOLD))
                 else:
-                    safe_addstr(scr, y, 6, label)
-                    safe_addstr(scr, y, 6 + len(label) + 2, value, color(C_VALUE))
-                y += 1
+                    put(yv, 6, label)
+                    put(yv, 6 + len(label) + 2, value, color(C_VALUE))
 
         footer = "UP/DOWN: select   LEFT/RIGHT/ENTER: change   ESC: back"
         safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
