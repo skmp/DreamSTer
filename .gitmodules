@@ -1,0 +1,9 @@
+[submodule "polly2-rtl"]
+	path = polly2-rtl
+	url = ../polly2-rtl.git
+[submodule "GLdc"]
+	path = GLdc
+	url = ../polly2-rtl-GLdc.git
+[submodule "minicast"]
+	path = minicast
+	url = ../minicast.git
