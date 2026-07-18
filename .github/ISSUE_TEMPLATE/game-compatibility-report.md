@@ -6,6 +6,8 @@ labels: uncategorized
 assignees: skmp
 
 ---
+**BEFORE CONTINUING, MAKE SURE NO OTHER ISSUE EXISTS FOR THIS GAME**
+If one exists, make a post there.
 
 **Describe the status of the game**
 - What works
