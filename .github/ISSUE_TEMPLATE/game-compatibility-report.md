@@ -23,4 +23,6 @@ Drag and drop
 - Release: rX. Fill in which release you used. Reports should only be done for official releases
 
 **Additional context**
-Add any other context you think we need
+- Game region
+- Game version (if you are certain about it)
+- Add any other context you think we need
