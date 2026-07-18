@@ -16,4 +16,4 @@ launches minicast and re-loads menu.rbf / re-starts MiSTer once done.
 Setup [Video tutorial by Pixel Cherry Ninja](https://youtu.be/r7nzop2nVWg?si=ldTbRYXF_mA8pDR5&t=1152)
 
 ### Help needed - We need to test the Dreamcast library
-Update issues (or file new ones for games we don't have already). There's an issue template to help you.
+[Update issues](https://github.com/skmp/DreamSTer/issues) (or file [new ones](https://github.com/skmp/DreamSTer/issues) for games we don't have already). There's an issue template to help you.
