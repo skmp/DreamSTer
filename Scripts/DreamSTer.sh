@@ -26,10 +26,13 @@ import time
 
 TITLE = "DreamSTer Hybrid Core"
 
-DC_DIR = "/media/fat/games/Dreamcast"
-BOOT_BIN = os.path.join(DC_DIR, "dc_boot.bin")
-FLASH_BIN = os.path.join(DC_DIR, "dc_flash.bin")
-CFG_PATH = os.path.join(DC_DIR, "emu.cfg")
+SYSTEM_DIR = "/media/fat/games/Dreamcast"
+USB_GAME_DIR_GLOB = "/media/usb*/games/Dreamcast"
+STARTUP_STORAGE_READY_AT = 30.0
+STORAGE_POLL_INTERVAL = 0.5
+BOOT_BIN = os.path.join(SYSTEM_DIR, "dc_boot.bin")
+FLASH_BIN = os.path.join(SYSTEM_DIR, "dc_flash.bin")
+CFG_PATH = os.path.join(SYSTEM_DIR, "emu.cfg")
 
 MINICAST_DIR = "/media/fat/minicast"
 LOAD_BITSTREAM = os.path.join(MINICAST_DIR, "load_fpga_bitstream")
@@ -239,15 +242,98 @@ def save_cfg(cfg):
 
 # ----------------------------------------------------------------- games ---
 
-def scan_games():
+def _existing_absolute_dirs(paths):
+    directories = []
+    seen = set()
+    for path in paths:
+        path = os.path.normpath(path.strip())
+        if (not path or not os.path.isabs(path) or path in seen or
+                not os.path.isdir(path)):
+            continue
+        seen.add(path)
+        directories.append(path)
+    return directories
+
+
+def _configured_game_dirs(cfg):
+    content_paths = ""
+    if cfg.has_section("config"):
+        content_paths = cfg.get(
+            "config", "Dreamcast.ContentPath", fallback="")
+    return _existing_absolute_dirs(content_paths.split(";"))
+
+
+def _first_external_game_dir(usb_glob=USB_GAME_DIR_GLOB):
+    external = _existing_absolute_dirs(sorted(glob.glob(usb_glob)))
+    return external[0] if external else None
+
+
+def resolve_game_dirs(cfg, system_dir=SYSTEM_DIR,
+                      usb_glob=USB_GAME_DIR_GLOB):
+    """Returns configured game roots, then USB/NVMe, then microSD."""
+    configured = _configured_game_dirs(cfg)
+    if configured:
+        return configured
+
+    external = _first_external_game_dir(usb_glob)
+    if external:
+        return [external]
+
+    return [os.path.normpath(system_dir)]
+
+
+def should_wait_for_external(cfg, game_dirs, games,
+                             system_dir=SYSTEM_DIR):
+    return (not _configured_game_dirs(cfg) and not games and
+            game_dirs == [os.path.normpath(system_dir)])
+
+
+def startup_storage_wait_seconds(
+        uptime_path="/proc/uptime",
+        ready_at=STARTUP_STORAGE_READY_AT):
+    try:
+        with open(uptime_path, "r", encoding="ascii") as uptime_file:
+            uptime = float(uptime_file.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+    return max(0.0, ready_at - uptime)
+
+
+def wait_for_external_game_dir(
+        timeout, usb_glob=USB_GAME_DIR_GLOB,
+        poll_interval=STORAGE_POLL_INTERVAL,
+        clock_func=time.monotonic, sleep_func=time.sleep):
+    if timeout <= 0:
+        return None
+
+    deadline = clock_func() + timeout
+    while True:
+        external = _first_external_game_dir(usb_glob)
+        if external:
+            return external
+        remaining = deadline - clock_func()
+        if remaining <= 0:
+            return None
+        sleep_func(min(poll_interval, remaining))
+
+
+def scan_games(game_dirs):
     games = []
-    for root, dirs, files in os.walk(DC_DIR):
-        dirs.sort()
-        for name in sorted(files):
-            if name.lower().endswith(GAME_EXTS):
-                path = os.path.join(root, name)
-                games.append((os.path.relpath(path, DC_DIR), path))
-    games.sort(key=lambda g: g[0].lower())
+    seen = set()
+    for game_dir in game_dirs:
+        game_dir = os.path.normpath(game_dir)
+        for root, dirs, files in os.walk(game_dir):
+            dirs.sort()
+            for name in sorted(files):
+                if not name.lower().endswith(GAME_EXTS):
+                    continue
+                path = os.path.abspath(os.path.join(root, name))
+                path_key = os.path.normcase(os.path.realpath(path))
+                if path_key in seen:
+                    continue
+                seen.add(path_key)
+                games.append((os.path.relpath(path, game_dir), path))
+    games.sort(key=lambda game: (game[0].lower(), game[1].lower()))
     return games
 
 
@@ -1349,8 +1435,8 @@ def error_screen(scr, lines):
     scr.getch()
 
 
-def main_menu_screen(scr, games):
-    """Returns ("inputmap",), ("bios",), ("game", path), or None to exit."""
+def main_menu_screen(scr, games, game_dirs):
+    """Returns an action tuple or None to exit."""
     rows = [("header", "System"),
             ("inputmap", None),
             ("bios", None),
@@ -1362,7 +1448,9 @@ def main_menu_screen(scr, games):
     sel = 3 if games else 1
     top = 0
     while True:
-        draw_title(scr, "%d game(s) found in %s" % (len(games), DC_DIR))
+        source = (game_dirs[0] if len(game_dirs) == 1
+                  else "%d folders" % len(game_dirs))
+        draw_title(scr, "%d game(s) found in %s" % (len(games), source))
         h, w = scr.getmaxyx()
         list_top = 4
         list_h = max(1, h - list_top - 2)
@@ -1407,7 +1495,7 @@ def main_menu_screen(scr, games):
         elif ch in KEY_ENTER:
             kind, payload = rows[selectable[sel]]
             if kind == "game":
-                return ("game", payload[1])
+                return ("game", payload[0], payload[1])
             if kind == "exit":
                 return None
             return (kind,)
@@ -1519,12 +1607,22 @@ def ui(scr):
     cfg = load_cfg()
     load_input_config(cfg)
 
-    games = scan_games()
+    game_dirs = resolve_game_dirs(cfg)
+    games = scan_games(game_dirs)
+    if should_wait_for_external(cfg, game_dirs, games):
+        wait_seconds = startup_storage_wait_seconds()
+        if wait_seconds > 0:
+            draw_title(scr, "Waiting for USB/NVMe game storage...")
+            scr.refresh()
+            external = wait_for_external_game_dir(wait_seconds)
+            if external:
+                game_dirs = [external]
+                games = scan_games(game_dirs)
 
     NAV[0] = NavPump()
     try:
         while True:
-            res = main_menu_screen(scr, games)
+            res = main_menu_screen(scr, games, game_dirs)
             if res is None:
                 return None
             if res[0] == "inputmap":
@@ -1532,9 +1630,12 @@ def ui(scr):
                 NAV[0].close()
                 NAV[0] = NavPump()  # mappings may have changed
                 continue
-            game = "nodisk" if res[0] == "bios" else res[1]
-            subtitle = ("Boot To Bios" if game == "nodisk"
-                        else os.path.relpath(game, DC_DIR))
+            if res[0] == "bios":
+                game = "nodisk"
+                subtitle = "Boot To Bios"
+            else:
+                game = res[2]
+                subtitle = res[1]
             if config_screen(scr, cfg, subtitle):
                 return game
     finally:
