@@ -7,7 +7,8 @@ lets the user tweak emu.cfg and launches minicast on the polly2-rtl bitstream.
 The MiSTer main binary is killed as soon as the script starts (so it stops
 eating input/video) and is ALWAYS restarted when the script exits, on every
 path. Menus navigate from the terminal keyboard (console tty or ssh pty) and
-from any configured evdev device: mapped dpad moves, A confirms, B cancels.
+from any configured evdev device: mapped dpad moves, A confirms; leaving
+a screen is always an explicit Back/Exit menu entry.
 """
 
 import configparser
@@ -42,7 +43,11 @@ MENU_RBF = "/media/fat/menu.rbf"
 GAME_EXTS = (".cdi", ".cue", ".gdi")
 
 KEY_ENTER = (curses.KEY_ENTER, 10, 13)
-KEY_ESC = 27
+
+# There is deliberately NO ESC/B "back" shortcut: a laggy arrow-key escape
+# sequence decays into a bare tty ESC, which used to quit menus at random.
+# tty ESC (and any other unmapped key) is ignored; every screen navigates
+# through explicit Back/Exit menu entries instead.
 
 DEFAULT_CFG = """\
 [audio]
@@ -734,8 +739,7 @@ def capture_mapping(scr, dev, render, prompt="Waiting"):
                 str(n) for n in range(CAPTURE_SECONDS, remaining - 1, -1)) + "]"
             render(text)
             scr.refresh()
-            if scr.getch() == KEY_ESC:
-                return None
+            scr.getch()   # drain tty so captured keys don't leak into menus
             r, _, _ = select.select([fd], [], [], 0.05)
             if not r:
                 continue
@@ -839,7 +843,7 @@ class DCState:
 
 # --------------------------------------------------------- evdev menu nav ---
 # Menu navigation from configured evdev devices: the mapped dpad moves the
-# cursor, A confirms (ENTER), B cancels (ESC). Keyboard-kind devices are
+# cursor, A confirms (ENTER). Keyboard-kind devices are
 # deliberately NOT read here: their input already arrives through the
 # terminal (console tty locally, pty over ssh), so reading them from evdev
 # too would process every key twice. Gamepads/mice produce no tty input, so
@@ -852,7 +856,6 @@ NAV_KEYS = {
     "dpad_left": curses.KEY_LEFT,
     "dpad_right": curses.KEY_RIGHT,
     "btn_a": 10,        # confirm / enter
-    "btn_b": KEY_ESC,   # cancel / back
 }
 NAV_REPEAT = ("dpad_up", "dpad_down", "dpad_left", "dpad_right")
 NAV_REPEAT_DELAY = 0.40
@@ -988,11 +991,14 @@ def test_screen(scr, devices, subtitle):
         states[fd] = DCState(dev, fd)
     scr.nodelay(True)
     top = 0
-    b_hold = {}  # fd -> monotonic time btn_b went down (hold B to exit)
+    # the only exits are the pinned Back entry (tty ENTER) or a fresh A
+    # press on a device; armed per-device only after A is first seen
+    # released, so the press that opened this screen can't exit it
+    a_prev = {}  # fd -> btn_a held on the previous pump
     try:
         while True:
             ch = scr.getch()
-            if ch == KEY_ESC:
+            if ch in KEY_ENTER:
                 return
             if ch == curses.KEY_UP:
                 top -= 1
@@ -1006,7 +1012,7 @@ def test_screen(scr, devices, subtitle):
                         os.close(fd)
                         del states[fd]
                         del fds[fd]
-                        b_hold.pop(fd, None)
+                        a_prev.pop(fd, None)
                         continue
                     for etype, code, value in evs:
                         states[fd].feed(etype, code, value)
@@ -1015,18 +1021,16 @@ def test_screen(scr, devices, subtitle):
             for st in states.values():
                 st.tick()
 
-            # a B tap is just being tested; holding it 1.5s means "back"
-            now = time.monotonic()
             for fd, st in states.items():
-                if "btn_b" in st.buttons:
-                    if now - b_hold.setdefault(fd, now) >= 1.5:
-                        return
-                else:
-                    b_hold.pop(fd, None)
+                a_now = "btn_a" in st.buttons
+                if a_now and not a_prev.get(fd, True):
+                    return
+                a_prev[fd] = a_now
 
             draw_title(scr, subtitle)
             h, _ = scr.getmaxyx()
-            list_top = 4
+            safe_addstr(scr, 3, 2, "> Back", color(C_SEL, curses.A_BOLD))
+            list_top = 5
             list_h = max(1, h - list_top - 2)
             total = sum(3 if not states[fd].cfg else 4 for fd in fds)
             top = max(0, min(top, max(0, total - list_h)))
@@ -1071,7 +1075,7 @@ def test_screen(scr, devices, subtitle):
                 yv += 2
             safe_addstr(scr, h - 1, 1,
                         "Press buttons / move axes   UP/DOWN: scroll   "
-                        "ESC / hold B: back", color(C_DIM))
+                        "ENTER/A: back", color(C_DIM))
             scr.refresh()
     finally:
         scr.nodelay(False)
@@ -1131,7 +1135,7 @@ def device_list_screen(scr, devices, cfg):
 
         if notice:
             safe_addstr(scr, h - 2, 1, notice, notice_attr)
-        footer = "UP/DOWN: select   ENTER/A: open   ESC/B: back"
+        footer = "UP/DOWN: select   ENTER/A: open"
         safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
         scr.refresh()
 
@@ -1151,8 +1155,6 @@ def device_list_screen(scr, devices, cfg):
                 notice_attr = color(C_VALUE)
                 continue
             return (kind, payload)
-        elif ch == KEY_ESC:
-            return None
 
 
 def device_screen(scr, dev):
@@ -1213,7 +1215,7 @@ def device_screen(scr, dev):
             else:
                 safe_addstr(scr, y, 4, text)
                 safe_addstr(scr, y, 6 + len(text) + 2, value, color(C_VALUE))
-        footer = "UP/DOWN: select   ENTER/A: map/activate   ESC/B: back"
+        footer = "UP/DOWN: select   ENTER/A: map/activate"
         safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
 
     while True:
@@ -1225,8 +1227,6 @@ def device_screen(scr, dev):
             sel = (sel - 1) % len(selectable)
         elif ch == curses.KEY_DOWN:
             sel = (sel + 1) % len(selectable)
-        elif ch == KEY_ESC:
-            return
         elif ch in KEY_ENTER:
             idx = selectable[sel]
             row = rows[idx]
@@ -1354,11 +1354,12 @@ def main_menu_screen(scr, games):
     rows = [("header", "System"),
             ("inputmap", None),
             ("bios", None),
+            ("exit", None),
             ("header", "Disc Images")]
     rows += [("game", g) for g in games]
     selectable = [i for i, r in enumerate(rows) if r[0] != "header"]
     # default to the first disc image if any, otherwise Boot To Bios
-    sel = 2 if games else 1
+    sel = 3 if games else 1
     top = 0
     while True:
         draw_title(scr, "%d game(s) found in %s" % (len(games), DC_DIR))
@@ -1384,6 +1385,8 @@ def main_menu_screen(scr, games):
                 text = "Configure Input"
             elif kind == "bios":
                 text = "Boot To Bios"
+            elif kind == "exit":
+                text = "Exit To MiSTer"
             else:
                 text = payload[0]
             if i == cur:
@@ -1392,7 +1395,7 @@ def main_menu_screen(scr, games):
             else:
                 safe_addstr(scr, y, 4, text)
 
-        footer = "UP/DOWN: select   ENTER/A: configure & launch   ESC/B: exit"
+        footer = "UP/DOWN: select   ENTER/A: select"
         safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
         scr.refresh()
 
@@ -1405,15 +1408,15 @@ def main_menu_screen(scr, games):
             kind, payload = rows[selectable[sel]]
             if kind == "game":
                 return ("game", payload[1])
+            if kind == "exit":
+                return None
             return (kind,)
-        elif ch == KEY_ESC:
-            return None
 
 
 def config_screen(scr, cfg, game_rel):
     """Returns True to launch, False to go back to the games list."""
-    # rows: ("launch",), ("header", text), ("opt", Option)
-    rows = [("launch",)]
+    # rows: ("launch",), ("back",), ("header", text), ("opt", Option)
+    rows = [("launch",), ("back",)]
     for group, opts in OPTION_GROUPS:
         rows.append(("header", group))
         for opt in opts:
@@ -1456,6 +1459,12 @@ def config_screen(scr, cfg, game_rel):
                     put(yv, 4, ">" + text, color(C_SEL, curses.A_BOLD))
                 else:
                     put(yv, 5, text, curses.A_BOLD)
+            elif row[0] == "back":
+                text = "  Back  "
+                if is_sel:
+                    put(yv, 4, ">" + text, color(C_SEL, curses.A_BOLD))
+                else:
+                    put(yv, 5, text)
             elif row[0] == "header":
                 put(yv + 1, 2, "[ %s ]" % row[1],
                     color(C_HEADER, curses.A_BOLD))
@@ -1471,7 +1480,7 @@ def config_screen(scr, cfg, game_rel):
                     put(yv, 6, label)
                     put(yv, 6 + len(label) + 2, value, color(C_VALUE))
 
-        footer = "UP/DOWN: select   LEFT/RIGHT/ENTER/A: change   ESC/B: back"
+        footer = "UP/DOWN: select   LEFT/RIGHT/ENTER/A: change"
         safe_addstr(scr, h - 1, 1, footer, color(C_DIM))
         scr.refresh()
 
@@ -1481,10 +1490,10 @@ def config_screen(scr, cfg, game_rel):
             sel = (sel - 1) % len(selectable)
         elif ch == curses.KEY_DOWN:
             sel = (sel + 1) % len(selectable)
-        elif ch == KEY_ESC:
-            return False
         elif ch in KEY_ENTER and row[0] == "launch":
             return True
+        elif ch in KEY_ENTER and row[0] == "back":
+            return False
         elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT) or ch in KEY_ENTER:
             if row[0] == "opt":
                 row[1].cycle(cfg, -1 if ch == curses.KEY_LEFT else 1)
