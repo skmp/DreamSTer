@@ -2,7 +2,7 @@
 name: Game Compatibility Report
 about: Helps us map out what works and what not
 title: Game name goes here
-labels: uncategorized
+labels: needs-review
 assignees: skmp
 
 ---
