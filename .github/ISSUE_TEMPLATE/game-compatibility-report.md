@@ -17,7 +17,9 @@ If one exists, make a post there.
 **Screenshots**
 Drag and drop
 - A screenshot or photo of DreamSTer settings screen
-- More screenshots to help us understand what is wrong / right
+- A least one representative screenshot/photo, even if everything is perfect
+- More screenshots/photos to help us understand what is wrong / right
+- Make sure to have the status report bar at the top visible
 
 **DreamSTer Release**
 - Release: rX. Fill in which release you used. Reports should only be done for official releases
