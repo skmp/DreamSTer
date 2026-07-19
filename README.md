@@ -17,3 +17,6 @@ Setup [Video tutorial by Pixel Cherry Ninja](https://youtu.be/r7nzop2nVWg?si=ldT
 
 ### Help needed - We need to test the Dreamcast library
 [Update issues](https://github.com/skmp/DreamSTer/issues) (or file [new ones](https://github.com/skmp/DreamSTer/issues) for games we don't have already). There's an issue template to help you.
+
+### Join the Impossible Ports Discord server for more
+[<img width="128" height="128" alt="impossibe" src="https://github.com/user-attachments/assets/70d49e4d-339d-4895-a8a3-182512c7c330" />](https://discord.gg/q4VMkcNJ39)
