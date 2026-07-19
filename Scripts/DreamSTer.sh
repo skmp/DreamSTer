@@ -26,10 +26,25 @@ import time
 
 TITLE = "DreamSTer Hybrid Core"
 
-DC_DIR = "/media/fat/games/Dreamcast"
+STORAGE_LOCATIONS = [
+    ("sd", "SD Card", "/media/fat/games/Dreamcast"),
+    ("usb0", "USB0", "/media/usb0/games/Dreamcast"),
+    ("cifs", "CIFS", "/media/fat/cifs/games/Dreamcast"),
+]
+DC_DIR = STORAGE_LOCATIONS[0][2]
 BOOT_BIN = os.path.join(DC_DIR, "dc_boot.bin")
 FLASH_BIN = os.path.join(DC_DIR, "dc_flash.bin")
 CFG_PATH = os.path.join(DC_DIR, "emu.cfg")
+
+
+def set_dc_dir(path):
+    global DC_DIR, BOOT_BIN, FLASH_BIN, CFG_PATH
+    DC_DIR = path
+    BOOT_BIN = os.path.join(DC_DIR, "dc_boot.bin")
+    FLASH_BIN = os.path.join(DC_DIR, "dc_flash.bin")
+    CFG_PATH = os.path.join(DC_DIR, "emu.cfg")
+
+
 
 MINICAST_DIR = "/media/fat/minicast"
 LOAD_BITSTREAM = os.path.join(MINICAST_DIR, "load_fpga_bitstream")
@@ -1349,6 +1364,36 @@ def error_screen(scr, lines):
     scr.getch()
 
 
+
+def storage_location_screen(scr, selected_key):
+    """Lets the user choose where Dreamcast files are stored."""
+    sel = next((i for i, item in enumerate(STORAGE_LOCATIONS)
+                if item[0] == selected_key), 0)
+    while True:
+        draw_title(scr, "Select Dreamcast storage location")
+        h, w = scr.getmaxyx()
+        start_y = max(4, h // 2 - len(STORAGE_LOCATIONS))
+        for i, (_key, label, path) in enumerate(STORAGE_LOCATIONS):
+            text = "%-10s %s" % (label, path)
+            y = start_y + i
+            if i == sel:
+                safe_addstr(scr, y, 1, " " * (w - 3), color(C_SEL))
+                safe_addstr(scr, y, 2, "> " + text,
+                            color(C_SEL, curses.A_BOLD))
+            else:
+                safe_addstr(scr, y, 4, text)
+        safe_addstr(scr, h - 1, 1,
+                    "UP/DOWN: select   ENTER/A: use location", color(C_DIM))
+        scr.refresh()
+        ch = nav_getch(scr)
+        if ch == curses.KEY_UP:
+            sel = (sel - 1) % len(STORAGE_LOCATIONS)
+        elif ch == curses.KEY_DOWN:
+            sel = (sel + 1) % len(STORAGE_LOCATIONS)
+        elif ch in KEY_ENTER:
+            return STORAGE_LOCATIONS[sel]
+
+
 def main_menu_screen(scr, games):
     """Returns ("inputmap",), ("bios",), ("game", path), or None to exit."""
     rows = [("header", "System"),
@@ -1510,10 +1555,19 @@ def ui(scr):
         pass
     init_colors()
 
+    # Storage selection is session-only; SD Card is selected by default
+    # whenever DreamSTer starts. No additional launcher config is created.
+    NAV[0] = NavPump()
+    _selected_key, _selected_label, selected_path = storage_location_screen(
+        scr, "sd")
+    set_dc_dir(selected_path)
+
     missing = [p for p in (BOOT_BIN, FLASH_BIN) if not os.path.isfile(p)]
     if missing:
         error_screen(scr, ["ERROR: required file missing:"] +
                      ["  %s" % p for p in missing])
+        NAV[0].close()
+        NAV[0] = None
         return None
 
     cfg = load_cfg()
@@ -1521,7 +1575,6 @@ def ui(scr):
 
     games = scan_games()
 
-    NAV[0] = NavPump()
     try:
         while True:
             res = main_menu_screen(scr, games)
