@@ -2,7 +2,9 @@
 """DreamSTer Hybrid Core - terminal UI for minicast / polly2-rtl.
 
 Python 3.9 / curses. Scans gane dir for .cdi/.cue/.gdi images,
-lets the user tweak emu.cfg and launches minicast on the polly2-rtl bitstream.
+lets the user tweak the global and per-game settings (DreamSTer.CFG) and
+launches minicast on the polly2-rtl bitstream with an emu.cfg generated from
+them.
 
 The MiSTer main binary is killed as soon as the script starts (so it stops
 eating input/video) and is ALWAYS restarted when the script exits, on every
@@ -35,7 +37,23 @@ STARTUP_STORAGE_READY_AT = 30.0
 STORAGE_POLL_INTERVAL = 0.5
 BOOT_BIN = os.path.join(SYSTEM_DIR, "dc_boot.bin")
 FLASH_BIN = os.path.join(SYSTEM_DIR, "dc_flash.bin")
-CFG_PATH = os.path.join(SYSTEM_DIR, "emu.cfg")
+
+# All DreamSTer settings: a [global] section plus one section per game (named
+# by the game's path) holding only that game's overrides. Keys are emu.cfg
+# "section.key" names, e.g. config.Dreamcast.Region.
+STORE_PATH = "/media/fat/config/DreamSTer.CFG"
+GLOBAL_SECTION = "global"
+# The pre-DreamSTer.CFG global config; imported once if STORE_PATH is missing.
+LEGACY_CFG_PATH = os.path.join(SYSTEM_DIR, "emu.cfg")
+# emu.cfg is generated here for each launch (global, then the game's
+# overrides), handed to minicast with -cfg-file and deleted afterwards.
+GENERATED_CFG_PATH = "/tmp/DreamSTer/emu.cfg"
+
+# VMU saves. minicast fills in {port} (A1, A2, ... D2) and {game_id} (the
+# disc's IP.bin product number).
+SAVES_DIR = "/media/fat/saves/DreamSTer"
+VMU_PORTS = tuple(bus + slot for bus in "ABCD" for slot in "12")
+VMU_NAMES = {"global": "global_{port}.sav", "game": "{game_id}_{port}.sav"}
 
 # [dreamster] Version stamp; a cfg without exactly this value is from a
 # different release and is reset (after a warning) before the UI runs.
@@ -144,7 +162,7 @@ aica.LimitFPS = yes
 aica.NoBatch = no
 aica.NoSound = no
 polly2.AutoReset = yes
-polly2.ClockSel = 2
+polly2.ClockSel = 3
 polly2.DumpOnLockup = no
 pvr.FPSTarget = 0
 pvr.ForceGLES2 = no
@@ -174,6 +192,7 @@ ta.skip = 0
 OptMode = balanced
 Overclock = 0
 Version = __CFG_VERSION__
+VmuMode = global
 
 [input]
 MouseSensitivity = 100
@@ -212,6 +231,11 @@ class Option:
     def enabled(self, cfg):
         return self._enabled(cfg) if self._enabled else True
 
+    def flat_keys(self):
+        """Every "section.key" set() writes; a per-game override stores and
+        clears exactly these."""
+        return ["%s.%s" % (self.section, self.key)]
+
     def current(self, cfg):
         return cfg.get(self.section, self.key, fallback=self.default).strip()
 
@@ -227,12 +251,6 @@ class Option:
             cfg.add_section(self.section)
         cfg.set(self.section, self.key, value)
 
-    def cycle(self, cfg, direction):
-        val = self.current(cfg)
-        idx = next((i for i, (v, _) in enumerate(self.choices) if v == val), -1)
-        idx = (idx + direction) % len(self.choices)
-        self.set(cfg, self.choices[idx][0])
-
 
 class RegionOption(Option):
     """Console region; the matching Broadcast standard is written with it."""
@@ -243,6 +261,9 @@ class RegionOption(Option):
         Option.__init__(self, "Region", "Dreamcast.Region",
                         [("1", "NTSC-US"), ("0", "NTSC-JP"), ("2", "PAL")],
                         "1")
+
+    def flat_keys(self):
+        return Option.flat_keys(self) + ["config.Dreamcast.Broadcast"]
 
     def set(self, cfg, value):
         Option.set(self, cfg, value)
@@ -265,6 +286,9 @@ class AudioOption(Option):
                         [("synced", "Synced"), ("unsynced", "Unsynced"),
                          ("off", "Off")], "synced")
 
+    def flat_keys(self):
+        return Option.flat_keys(self) + ["audio.disable"]
+
     def current(self, cfg):
         if cfg.get("audio", "disable", fallback="0").strip() == "1":
             return "off"
@@ -278,13 +302,6 @@ class AudioOption(Option):
         cfg.set("audio", "disable", "1" if value == "off" else "0")
         if value != "off":
             cfg.set("config", self.key, "yes" if value == "synced" else "no")
-
-    def cycle(self, cfg, direction):
-        val = self.current(cfg)
-        # a hand-edited cfg can hold an unknown value; fall back to the first
-        # choice instead of raising StopIteration
-        idx = next((i for i, (v, _) in enumerate(self.choices) if v == val), 0)
-        self.set(cfg, self.choices[(idx + direction) % len(self.choices)][0])
 
 
 def _is_freerunning(cfg):
@@ -433,6 +450,11 @@ class OptModeOption(Option):
                          ("experimental", "Experimental"), ("custom", "Custom")], "balanced",
                         section="dreamster")
 
+    def flat_keys(self):
+        # a preset is the mode plus every value it writes
+        return Option.flat_keys(self) + [k for o in OPT_ITEMS
+                                         for k in o.flat_keys()]
+
     def current(self, cfg):
         return opt_mode(cfg)
 
@@ -447,6 +469,10 @@ class OptModeOption(Option):
 REGION_OPT = RegionOption()
 CABLE_OPT = Option("Cable Type", "Dreamcast.Cable",
                    [("0", "VGA"), ("3", "Composite")], "0")
+# turned into Dreamcast.VmuName (VMU_NAMES) when emu.cfg is generated
+VMU_OPT = Option("VMU Saves", "VmuMode",
+                 [("global", "Shared"), ("game", "Per Game")], "global",
+                 section="dreamster")
 OVERCLOCK_OPT = Option("Overclock", "Overclock",
                        [("0", "No overclock"), ("1", "1 GHz")], "0",
                        section="dreamster")
@@ -459,17 +485,18 @@ FPS_OPT = Option("FPS Target", "pvr.FPSTarget",
                  enabled=lambda cfg: not _is_freerunning(cfg))
 OPTMODE_OPT = OptModeOption()
 AUTORESET_OPT = Option("AutoReset", "polly2.AutoReset", OPT_BOOL, "yes")
-# real PLL outputs (VCO/14, VCO/12); the hard clkctrl only routes two
-# clocks, sel bit [1] decides
+# CLK register slots 0-3: the core PLL's 900 MHz VCO / 12, 10, 9, 8
+# (polly2 sys_top); only 75 MHz is timing-closed
 CLOCK_OPT = Option("Clock", "polly2.ClockSel",
-                   [("0", "112.5 MHz"), ("2", "131.25 MHz")], "2")
+                   [("0", "75 MHz"), ("1", "90 MHz"), ("2", "100 MHz"),
+                    ("3", "112.5 MHz")], "3")
 DUMP_OPT = Option("Store Crash Dump", "polly2.DumpOnLockup", OPT_BOOL, "no")
 
 # every option Restore Defaults resets; OPTMODE last so the balanced preset
 # is what ends up in the OPT_ITEMS keys
-ALL_OPTIONS = [REGION_OPT, CABLE_OPT, OVERCLOCK_OPT, TIMEREC_OPT, AUDIO_OPT,
-               FPS_OPT, AUTORESET_OPT, CLOCK_OPT, DUMP_OPT] + OPT_ITEMS \
-              + [OPTMODE_OPT]
+ALL_OPTIONS = [REGION_OPT, CABLE_OPT, VMU_OPT, OVERCLOCK_OPT, TIMEREC_OPT,
+               AUDIO_OPT, FPS_OPT, AUTORESET_OPT, CLOCK_OPT, DUMP_OPT] \
+              + OPT_ITEMS + [OPTMODE_OPT]
 
 
 # ------------------------------------------------- dreamcast peripherals ---
@@ -513,6 +540,28 @@ def set_port_peripheral(cfg, port, pid):
         cfg.set("input", key, val)
 
 
+class PortOption(Option):
+    """What maple device sits on one port ([input] deviceN, .1, .2)."""
+
+    def __init__(self, port):
+        Option.__init__(self, PORT_NAMES[port], "device%d" % (port + 1),
+                        [(pid, label) for pid, label, _ in PERIPHERALS],
+                        None, section="input")
+        self.port = port
+
+    def flat_keys(self):
+        return ["input." + k for k in _periph_keys(self.port)]
+
+    def current(self, cfg):
+        return get_port_peripheral(cfg, self.port)
+
+    def display(self, cfg):
+        return PERIPHERAL_LABELS.get(self.current(cfg), "Custom")
+
+    def set(self, cfg, value):
+        set_port_peripheral(cfg, self.port, value)
+
+
 def port_accepts(cfg, port, dev_kind):
     """Keyboard/Mouse ports only take matching devices; controller (and
     None/unknown) ports take anything - keyboards and mice can still act
@@ -541,24 +590,339 @@ def restore_defaults(cfg):
     save_input_config(cfg, scan_devices())
 
 
-def reset_all_configuration():
-    """Version-mismatch reset: rewrite emu.cfg from the pristine template
-    (dropping any stale keys from other releases), then re-materialize
-    default input mappings. Returns (cfg, ok) where ok is False if the
-    template could not be written."""
-    ok = write_text_file(CFG_PATH, DEFAULT_CFG)
-    cfg = load_cfg()
+def clear_game_overrides(cfg):
+    """Game view: drop every override, so the game uses the global
+    configuration again."""
+    cfg._over.clear()
+    rebuild_view(cfg)
+    CONFIG.clear()
+    PORTS.clear()
+    load_input_config(cfg)
+    save_cfg(cfg)
+
+
+def reset_all_configuration(store):
+    """Version-mismatch reset: [global] from the pristine template (dropping
+    any stale keys from other releases), every game's overrides dropped, then
+    default input mappings re-materialized. Returns (cfg, ok) where ok is
+    False if DreamSTer.CFG could not be written."""
+    defaults = _emu_parser()
+    defaults.read_string(DEFAULT_CFG)
+    store.reset(flatten(defaults))
+    cfg = global_view(store)
     CONFIG.clear()
     PORTS.clear()
     save_input_config(cfg, scan_devices())
-    return cfg, ok
+    return cfg, save_cfg(cfg)
 
 
-def game_config_path(game_path):
-    if not game_path or game_path == "nodisk":
-        return None
-    stem, _ = os.path.splitext(game_path)
-    return stem + ".cfg"
+# -------------------------------------------------------- config storage ---
+# DreamSTer.CFG keeps flat "section.key" names. The menus work on
+# emu.cfg-shaped views of it: the global view is [global]; a game view is
+# [global] with the game's overrides applied on top. A view carries its scope:
+#   _store  the ConfigStore
+#   _game   None for the global view, else the game path
+#   _over   game views only: the game's overrides, {"section.key": value}
+
+# "game" when a game has its own input mappings ([inputN] sections), which
+# then replace the global ones as a whole
+INPUT_MAPPING_KEY = "dreamster.InputMapping"
+_INPUT_SECTION_KEY = re.compile(r"input\d+\.")
+
+# per-game option value meaning "no override"
+USE_GLOBAL = object()
+
+
+def _emu_parser():
+    cfg = configparser.ConfigParser(interpolation=None)
+    cfg.optionxform = str  # preserve key case
+    return cfg
+
+
+def _store_parser():
+    # "=" only, since values hold ':' (input mappings, device ids);
+    # strict=False so a hand-edited file with a repeated section still loads
+    parser = configparser.ConfigParser(interpolation=None, strict=False,
+                                       delimiters=("=",))
+    parser.optionxform = str
+    return parser
+
+
+def flatten(cfg):
+    """emu.cfg-shaped parser -> {"section.key": value}"""
+    return {"%s.%s" % (section, key): value
+            for section in cfg.sections()
+            for key, value in cfg.items(section, raw=True)}
+
+
+def apply_flat(cfg, flat):
+    """Sets every "section.key" of flat in an emu.cfg-shaped parser."""
+    for name, value in flat.items():
+        section, _, key = name.partition(".")
+        if not section or not key:
+            continue
+        if not cfg.has_section(section):
+            cfg.add_section(section)
+        cfg.set(section, key, value)
+
+
+def merge_flat(global_flat, over):
+    """The global configuration with a game's overrides applied."""
+    flat = dict(global_flat)
+    if over.get(INPUT_MAPPING_KEY) == "game":
+        for name in [n for n in flat if _INPUT_SECTION_KEY.match(n)]:
+            del flat[name]
+    flat.update(over)
+    return flat
+
+
+class ConfigStore:
+    """DreamSTer.CFG: [global] plus one section of overrides per game, named
+    by the game's path."""
+
+    def __init__(self, path=STORE_PATH):
+        self.path = path
+        self.parser = _store_parser()
+
+    def read(self):
+        """Loads the file. False (and an empty store) if it is unreadable."""
+        try:
+            with open(self.path, encoding="utf-8",
+                      errors="surrogateescape") as f:
+                self.parser.read_file(f)
+            return True
+        except (configparser.Error, OSError, ValueError):
+            self.parser = _store_parser()
+            return False
+
+    def _get(self, section):
+        if not self.parser.has_section(section):
+            return {}
+        return dict(self.parser.items(section, raw=True))
+
+    def _put(self, section, flat):
+        # in place, so the section keeps its position in the file
+        if self.parser.has_section(section):
+            for key in list(self.parser.options(section)):
+                self.parser.remove_option(section, key)
+        else:
+            self.parser.add_section(section)
+        for key, value in flat.items():
+            self.parser.set(section, key, value)
+
+    def global_flat(self):
+        return self._get(GLOBAL_SECTION)
+
+    def set_global(self, flat):
+        self._put(GLOBAL_SECTION, flat)
+
+    def game_flat(self, game):
+        return self._get(game)
+
+    def set_game(self, game, flat):
+        """Stores a game's overrides; a game without any loses its section."""
+        if flat:
+            self._put(game, flat)
+        else:
+            self.parser.remove_section(game)
+
+    def reset(self, global_flat):
+        """Leaves only [global], holding global_flat."""
+        self.parser = _store_parser()
+        self._put(GLOBAL_SECTION, global_flat)
+
+    def save(self):
+        """Writes the file through a temp file, so a power cut cannot leave
+        it half-written. Returns False on failure."""
+        tmp = self.path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8",
+                      errors="surrogateescape") as f:
+                self.parser.write(f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+            return True
+        except OSError:
+            return False
+
+
+def open_store(path=STORE_PATH, legacy_path=LEGACY_CFG_PATH):
+    """Loads DreamSTer.CFG. A missing one starts from the old global emu.cfg
+    if there is one (its version is then checked like any other), else from
+    the stock template; an unreadable one starts from the stock template."""
+    store = ConfigStore(path)
+    if os.path.isfile(path):
+        if store.read():
+            return store
+        legacy_path = None
+    cfg = _emu_parser()
+    if not (legacy_path and os.path.isfile(legacy_path)
+            and _read_cfg_into(cfg, legacy_path) and cfg.sections()):
+        cfg = _emu_parser()
+        cfg.read_string(DEFAULT_CFG)
+    store.set_global(flatten(cfg))
+    store.save()
+    return store
+
+
+def global_view(store):
+    cfg = _emu_parser()
+    apply_flat(cfg, store.global_flat())
+    if not cfg.has_section("config"):
+        cfg.add_section("config")
+    cfg._store, cfg._game, cfg._over = store, None, None
+    return cfg
+
+
+def game_view(store, game):
+    """Boot To Bios ("nodisk") is not a game: it gets the global view."""
+    if game == "nodisk":
+        return global_view(store)
+    cfg = _emu_parser()
+    cfg._store, cfg._game, cfg._over = store, game, store.game_flat(game)
+    rebuild_view(cfg)
+    return cfg
+
+
+def rebuild_view(cfg):
+    """Refills a game view from [global] and its overrides, in place (the
+    screens hold on to the object)."""
+    for section in cfg.sections():
+        cfg.remove_section(section)
+    apply_flat(cfg, merge_flat(cfg._store.global_flat(), cfg._over))
+    if not cfg.has_section("config"):
+        cfg.add_section("config")
+
+
+def save_cfg(cfg):
+    """Writes a view back to DreamSTer.CFG. Returns False on failure so
+    callers can warn instead of silently losing settings."""
+    store = cfg._store
+    if cfg._game is None:
+        store.set_global(flatten(cfg))
+    else:
+        if cfg._over.get(INPUT_MAPPING_KEY) == "game":
+            # the input pages edit the view's [inputN] sections directly
+            for name in [n for n in cfg._over if _INPUT_SECTION_KEY.match(n)]:
+                del cfg._over[name]
+            cfg._over.update((n, v) for n, v in flatten(cfg).items()
+                             if _INPUT_SECTION_KEY.match(n))
+        store.set_game(cfg._game, cfg._over)
+    return store.save()
+
+
+def is_overridden(cfg, opt):
+    return cfg._game is not None and any(n in cfg._over
+                                         for n in opt.flat_keys())
+
+
+def option_value(cfg, opt):
+    """The option's value, or USE_GLOBAL in a game view without an override
+    for it."""
+    if cfg._game is not None and not is_overridden(cfg, opt):
+        return USE_GLOBAL
+    return opt.current(cfg)
+
+
+def option_display(cfg, opt):
+    if option_value(cfg, opt) is USE_GLOBAL:
+        return "Use Global (%s)" % opt.display(cfg)
+    return opt.display(cfg)
+
+
+def next_option_value(cfg, opt, step):
+    """The value LEFT (step -1) or RIGHT (+1) moves to. In a game view the
+    choices start with USE_GLOBAL."""
+    values = [v for v, _ in opt.choices]
+    if cfg._game is not None:
+        values = [USE_GLOBAL] + values
+    cur = option_value(cfg, opt)
+    idx = values.index(cur) if cur in values else -1
+    return values[(idx + step) % len(values)]
+
+
+def set_option_value(cfg, opt, value):
+    """Applies a value from next_option_value. In a game view the option's
+    keys become overrides, or stop being ones for USE_GLOBAL."""
+    if value is USE_GLOBAL:
+        for name in opt.flat_keys():
+            cfg._over.pop(name, None)
+        rebuild_view(cfg)
+        return
+    opt.set(cfg, value)
+    if cfg._game is not None:
+        for name in opt.flat_keys():
+            section, _, key = name.partition(".")
+            if cfg.has_option(section, key):
+                cfg._over[name] = cfg.get(section, key)
+
+
+def input_mapping_per_game(cfg):
+    return cfg._game is not None and cfg._over.get(INPUT_MAPPING_KEY) == "game"
+
+
+def set_input_mapping_per_game(cfg, per_game):
+    """Game view: start per-game input mappings as a copy of the global ones,
+    or drop them to use the global ones again."""
+    for name in [n for n in cfg._over
+                 if n == INPUT_MAPPING_KEY or _INPUT_SECTION_KEY.match(n)]:
+        del cfg._over[name]
+    if per_game:
+        cfg._over[INPUT_MAPPING_KEY] = "game"
+        cfg._over.update((n, v) for n, v in cfg._store.global_flat().items()
+                         if _INPUT_SECTION_KEY.match(n))
+    rebuild_view(cfg)
+    CONFIG.clear()
+    PORTS.clear()
+    load_input_config(cfg)
+
+
+def generated_cfg(view, game):
+    """The emu.cfg minicast runs with: the view (global, plus the game's
+    overrides) and where the VMU files live."""
+    cfg = _emu_parser()
+    apply_flat(cfg, flatten(view))
+    mode = view.get("dreamster", "VmuMode", fallback="global").strip()
+    if game == "nodisk" or mode not in VMU_NAMES:
+        mode = "global"  # Boot To Bios has no game id
+    if not cfg.has_section("config"):
+        cfg.add_section("config")
+    cfg.set("config", "Dreamcast.VmuPath", SAVES_DIR)
+    cfg.set("config", "Dreamcast.VmuName", VMU_NAMES[mode])
+    return cfg
+
+
+def write_generated_cfg(cfg, path=GENERATED_CFG_PATH):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            cfg.write(f)
+        return True
+    except OSError as e:
+        print("ERROR: cannot write %s: %s" % (path, e))
+        return False
+
+
+def migrate_vmus(legacy_dir=MINICAST_DIR, saves_dir=SAVES_DIR):
+    """Moves VMU files from minicast's old default location (vmu_save_<port>
+    .bin in its own directory) to saves_dir/global_<port>.sav. An existing
+    global_<port>.sav is never overwritten; the old file then stays put."""
+    try:
+        os.makedirs(saves_dir, exist_ok=True)
+    except OSError as e:
+        print("warning: cannot create %s: %s" % (saves_dir, e))
+        return
+    for port in VMU_PORTS:
+        old = os.path.join(legacy_dir, "vmu_save_%s.bin" % port)
+        new = os.path.join(saves_dir, VMU_NAMES["global"].format(port=port))
+        if os.path.isfile(old) and not os.path.exists(new):
+            try:
+                shutil.move(old, new)
+                print("moved %s -> %s" % (old, new))
+            except OSError as e:
+                print("warning: could not move %s: %s" % (old, e))
 
 
 def _read_cfg_into(cfg, path):
@@ -570,39 +934,6 @@ def _read_cfg_into(cfg, path):
             cfg.read_file(f)
         return True
     except (configparser.Error, UnicodeDecodeError, OSError, ValueError):
-        return False
-
-
-def load_cfg(path=CFG_PATH):
-    cfg = configparser.ConfigParser(interpolation=None)
-    cfg.optionxform = str  # preserve key case
-    if path != CFG_PATH and os.path.isfile(CFG_PATH):
-        _read_cfg_into(cfg, CFG_PATH)
-    if os.path.isfile(path):
-        if not _read_cfg_into(cfg, path):
-            # corrupt/unreadable config: keep whatever the global config
-            # already gave us, or fall back to the stock template if the
-            # result is empty so the game still launches with sane values
-            if not cfg.sections():
-                cfg.read_string(DEFAULT_CFG)
-    elif path == CFG_PATH:
-        write_text_file(path, DEFAULT_CFG)
-        cfg.read_string(DEFAULT_CFG)
-    if not cfg.has_section("config"):
-        cfg.add_section("config")
-    cfg._save_path = path
-    return cfg
-
-
-def save_cfg(cfg):
-    """Write cfg back to the file it came from. Returns False on failure so
-    callers can warn instead of silently losing settings."""
-    path = getattr(cfg, "_save_path", CFG_PATH)
-    try:
-        with open(path, "w") as f:
-            cfg.write(f)
-        return True
-    except OSError:
         return False
 
 
@@ -929,6 +1260,7 @@ CONFIG = {}
 # kcode[port] etc.
 PORTS = {}
 PORT_NAMES = ("Port A", "Port B", "Port C", "Port D")
+PORT_OPTS = [PortOption(port) for port in range(4)]
 
 
 def device_port(dev_id):
@@ -1140,7 +1472,7 @@ def load_input_config(cfg):
 
 
 def save_input_config(cfg, devices):
-    """Rewrites [input0]..[inputN] in the shared emu.cfg parser and saves.
+    """Rewrites [input0]..[inputN] in the config view and saves.
     Returns the number of device sections written."""
     # materialize defaults for connected devices so the C++ side only
     # ever needs emu.cfg
@@ -1666,7 +1998,7 @@ def device_list_screen(scr, devices, cfg):
 def device_screen(scr, dev, cfg, devices):
     # rows: ("back",), ("test",), ("header", text), ("map", key, label),
     #       ("remove",)
-    # every mutation is saved to emu.cfg immediately (auto-save)
+    # every mutation is saved immediately (auto-save)
     rows = [("back",), ("header", "General"), ("test",), ("port",),
             ("header", "Mappings")]
     rows += [("map", key, label) for key, label in TARGETS]
@@ -2026,9 +2358,7 @@ OVERCLOCK_WARNING = [
 ]
 
 def restore_warning(scope):
-    """Danger-Zone confirmation. `scope` is the config being reset: the
-    pre-launch page only rewrites that game's cfg, the global page rewrites
-    emu.cfg."""
+    """Danger-Zone confirmation for the global configuration."""
     return [
         "Restore %s settings to their defaults?" % scope,
         "",
@@ -2036,6 +2366,14 @@ def restore_warning(scope):
         "assignments and all saved input mappings will be",
         "reset. This cannot be undone.",
     ]
+
+RESET_TO_GLOBAL_WARNING = [
+    "Reset this game's settings?",
+    "",
+    "Every Configure option, the Dreamcast peripheral",
+    "assignments and the input mappings go back to",
+    "Use Global. This cannot be undone.",
+]
 
 VERSION_WARNING = [
     "Configuration reset required",
@@ -2070,10 +2408,9 @@ def peripherals_screen(scr, cfg):
                 text = "Back"
                 value = ""
             else:
-                port = row[1]
-                text = "%-26s" % PORT_NAMES[port]
-                pid = get_port_peripheral(cfg, port)
-                value = "< %s >" % PERIPHERAL_LABELS.get(pid, "Custom")
+                opt = PORT_OPTS[row[1]]
+                text = "%-26s" % opt.label
+                value = "< %s >" % option_display(cfg, opt)
             attr = (color(C_BG_SEL, curses.A_BOLD) if is_sel
                     else color(C_TEXT_SUB))
             if is_sel:
@@ -2095,28 +2432,29 @@ def peripherals_screen(scr, cfg):
             return
         elif (ch in (curses.KEY_LEFT, curses.KEY_RIGHT) or ch in KEY_ENTER) \
                 and row[0] == "port":
-            port = row[1]
+            opt = PORT_OPTS[row[1]]
             step = -1 if ch == curses.KEY_LEFT else 1
-            ids = [pid for pid, _, _ in PERIPHERALS]
-            pid = get_port_peripheral(cfg, port)
-            idx = ids.index(pid) if pid in ids else -1
-            set_port_peripheral(cfg, port, ids[(idx + step) % len(ids)])
+            set_option_value(cfg, opt, next_option_value(cfg, opt, step))
             save_cfg(cfg)
 
 
 def configure_screen(scr, cfg, subtitle, launch=False):
-    """The Configure menu. With launch=True a Launch entry is pinned on
-    top (pre-launch flow); returns True to launch, False/None otherwise."""
+    """The Configure menu, on the global view or a game view (every option
+    then has a Use Global choice). With launch=True a Launch entry is pinned
+    on top (pre-launch flow); returns True to launch, False/None otherwise."""
+    game_scope = cfg._game is not None
     # rows: ("launch",), ("back",), ("header", text), ("opt", Option),
-    #       ("page", label, target), ("restore",)
+    #       ("inputsrc",), ("page", label, target), ("restore",)
     rows = [("launch",)] if launch else []
     rows += [("back",)]
     rows += [("header", "Dreamcast"),
-             ("opt", REGION_OPT), ("opt", CABLE_OPT),
+             ("opt", REGION_OPT), ("opt", CABLE_OPT), ("opt", VMU_OPT),
              ("page", "Dreamcast Peripherals", "periph")]
-    rows += [("header", "DE10-Nano"),
-             ("opt", OVERCLOCK_OPT),
-             ("page", "Input Mapping", "inputmap")]
+    rows += [("header", "DE10-Nano"), ("opt", OVERCLOCK_OPT)]
+    if game_scope:
+        rows += [("inputsrc",), ("page", "Edit Input Mapping", "inputmap")]
+    else:
+        rows += [("page", "Input Mapping", "inputmap")]
     rows += [("header", "Minicast"),
              ("opt", TIMEREC_OPT), ("opt", AUDIO_OPT), ("opt", FPS_OPT),
              ("opt", OPTMODE_OPT)]
@@ -2126,6 +2464,14 @@ def configure_screen(scr, cfg, subtitle, launch=False):
     rows += [("header", "Danger Zone"), ("restore",)]
     selectable = [i for i, r in enumerate(rows) if r[0] != "header"]
     sel = 0  # Launch (pre-launch flow) / Back
+
+    def row_enabled(r):
+        if r[0] == "opt":
+            return r[1].enabled(cfg)
+        if r[0] == "page" and r[2] == "inputmap" and game_scope:
+            # a game edits only its own mappings
+            return input_mapping_per_game(cfg)
+        return True
 
     # headers take two lines (blank + text), everything else one
     heights = [2 if r[0] == "header" else 1 for r in rows]
@@ -2172,17 +2518,27 @@ def configure_screen(scr, cfg, subtitle, launch=False):
                 put(yv + 1, 2, "[ %s ]" % row[1],
                     color(C_HEADER, curses.A_BOLD))
             elif row[0] in ("page", "restore"):
-                text = ("Restore Defaults" if row[0] == "restore"
-                        else "%s ..." % row[1])
-                if is_sel:
+                if row[0] == "restore":
+                    text = ("Reset To Global Settings" if game_scope
+                            else "Restore Defaults")
+                else:
+                    text = "%s ..." % row[1]
+                if not row_enabled(row):
+                    put(yv, 6, text, color(C_DIM))
+                elif is_sel:
                     put(yv, 4, "> " + text, color(C_SEL, curses.A_BOLD))
                 else:
                     put(yv, 6, text)
             else:
-                opt = row[1]
-                label = "%-28s" % opt.label
-                value = "< %s >" % opt.display(cfg)
-                if not opt.enabled(cfg):
+                if row[0] == "inputsrc":
+                    label = "%-28s" % "Input Mapping"
+                    value = "< %s >" % ("Per Game"
+                                        if input_mapping_per_game(cfg)
+                                        else "Use Global")
+                else:
+                    label = "%-28s" % row[1].label
+                    value = "< %s >" % option_display(cfg, row[1])
+                if not row_enabled(row):
                     put(yv, 6, label, color(C_DIM))
                     put(yv, 6 + len(label) + 2, value, color(C_DIM))
                 elif is_sel:
@@ -2198,12 +2554,11 @@ def configure_screen(scr, cfg, subtitle, launch=False):
         scr.refresh()
 
         def move_sel(delta):
-            # skip disabled options (grayed out, not selectable)
+            # skip disabled rows (grayed out, not selectable)
             s = sel
             for _ in range(len(selectable)):
                 s = (s + delta) % len(selectable)
-                r = rows[selectable[s]]
-                if r[0] != "opt" or r[1].enabled(cfg):
+                if row_enabled(rows[selectable[s]]):
                     return s
             return sel
 
@@ -2218,33 +2573,42 @@ def configure_screen(scr, cfg, subtitle, launch=False):
         elif ch in KEY_ENTER and row[0] == "back":
             return False
         elif ch in KEY_ENTER and row[0] == "page":
+            if not row_enabled(row):
+                continue
             if row[2] == "periph":
                 peripherals_screen(scr, cfg)
             else:
                 input_mapper(scr, cfg)
                 rebuild_nav()
         elif ch in KEY_ENTER and row[0] == "restore":
-            scope = "this game's" if launch else "all global"
-            if confirm_screen(scr, restore_warning(scope), "Danger Zone"):
+            if game_scope:
+                if confirm_screen(scr, RESET_TO_GLOBAL_WARNING, "Danger Zone"):
+                    clear_game_overrides(cfg)
+                    rebuild_nav()
+            elif confirm_screen(scr, restore_warning("all global"),
+                                "Danger Zone"):
                 restore_defaults(cfg)
                 rebuild_nav()
         elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT) or ch in KEY_ENTER:
-            if row[0] == "opt" and row[1].enabled(cfg):
+            if row[0] == "inputsrc":
+                set_input_mapping_per_game(cfg,
+                                           not input_mapping_per_game(cfg))
+                rebuild_nav()
+                save_cfg(cfg)
+            elif row[0] == "opt" and row[1].enabled(cfg):
                 opt = row[1]
-                if opt is OVERCLOCK_OPT:
-                    # 1 GHz only engages after an explicit warning
-                    new = "0" if opt.current(cfg) == "1" else "1"
-                    if new == "1" and not confirm_screen(
-                            scr, OVERCLOCK_WARNING, "DE10-Nano Overclock"):
-                        continue
-                    opt.set(cfg, new)
-                else:
-                    opt.cycle(cfg, -1 if ch == curses.KEY_LEFT else 1)
+                new = next_option_value(cfg, opt,
+                                        -1 if ch == curses.KEY_LEFT else 1)
+                # 1 GHz only engages after an explicit warning
+                if opt is OVERCLOCK_OPT and new == "1" and not confirm_screen(
+                        scr, OVERCLOCK_WARNING, "DE10-Nano Overclock"):
+                    continue
+                set_option_value(cfg, opt, new)
                 save_cfg(cfg)
 
 
 def ui(scr):
-    """Runs the curses UI. Returns game path to launch, or None."""
+    """Runs the curses UI. Returns (store, game path) to launch, or None."""
     curses.curs_set(0)
     scr.keypad(True)
     try:
@@ -2264,14 +2628,15 @@ def ui(scr):
 
 
 def ui_loop(scr):
-    cfg = load_cfg()
+    store = open_store()
+    cfg = global_view(store)
     if cfg.get("dreamster", "Version", fallback="").strip() != CFG_VERSION:
         if not confirm_screen(scr, VERSION_WARNING, "Configuration Reset",
                               yes="OK", no="Exit"):
             return None
-        cfg, ok = reset_all_configuration()
+        cfg, ok = reset_all_configuration(store)
         if not ok:
-            error_screen(scr, ["ERROR: cannot write", CFG_PATH,
+            error_screen(scr, ["ERROR: cannot write", STORE_PATH,
                                "(read-only media?)"])
             return None
     load_input_config(cfg)
@@ -2304,12 +2669,14 @@ def ui_loop(scr):
         else:
             game = res[2]
             subtitle = res[1]
-        game_cfg = load_cfg(game_config_path(game) or CFG_PATH)
+        # Boot To Bios edits the global configuration: the same view object,
+        # so the main menu's Configure never saves over its changes
+        view = cfg if game == "nodisk" else game_view(store, game)
         CONFIG.clear()
         PORTS.clear()
-        load_input_config(game_cfg)
-        if configure_screen(scr, game_cfg, subtitle, launch=True):
-            return game
+        load_input_config(view)
+        if configure_screen(scr, view, subtitle, launch=True):
+            return store, game
 
 
 # ---------------------------------------------------------------- launch ---
@@ -2391,10 +2758,15 @@ def restart_mister():
 
 
 CPUFREQ_DIR = "/sys/devices/system/cpu/cpu0/cpufreq"
+# MiSTer's cpufreq driver; its 1 GHz step is a boost frequency, only allowed
+# while boost is enabled
+CPUFREQ_MODULE = "socfpga-cpufreq"
+CPUFREQ_BOOST = "/sys/devices/system/cpu/cpufreq/boost"
 # non-overclocked ceiling of the DE10-NSoC used here (kHz)
 STOCK_MAX_FREQ = "800000"
 
 
+# name is relative to CPUFREQ_DIR, or an absolute path (CPUFREQ_BOOST)
 def _cpufreq_read(name):
     try:
         with open(os.path.join(CPUFREQ_DIR, name)) as f:
@@ -2413,24 +2785,18 @@ def _cpufreq_write(name, value):
         return False
 
 
-def launch(game, overclock):
+def launch(store, game):
     print("\n=== %s ===" % TITLE)
     print("Launching: %s\n" % game)
 
-    cfg_path = game_config_path(game)
-    minicast_cmd = [MINICAST_ELF, game]
+    view = game_view(store, game)
+    overclock = view.get("dreamster", "Overclock",
+                         fallback="0").strip() == "1"
+    migrate_vmus()
+    if not write_generated_cfg(generated_cfg(view, game)):
+        return 1
+    minicast_cmd = [MINICAST_ELF, "-cfg-file", GENERATED_CFG_PATH, game]
     status = 0
-    if cfg_path:
-        game_cfg = load_cfg(cfg_path)
-        if not save_cfg(game_cfg):
-            print("warning: could not write %s" % cfg_path)
-        # a game literally named emu.cdi/.cue has <stem>.cfg == emu.cfg;
-        # copying a file onto itself would abort the launch
-        if os.path.abspath(cfg_path) != os.path.abspath(CFG_PATH):
-            try:
-                shutil.copyfile(cfg_path, CFG_PATH)
-            except OSError as e:
-                print("warning: could not stage %s: %s" % (CFG_PATH, e))
 
     basename = os.path.splitext(os.path.basename(game))[0]
     dirname = os.path.dirname(game)
@@ -2441,10 +2807,18 @@ def launch(game, overclock):
 
     prev_gov = None
     prev_max = None
+    prev_boost = None
     if overclock:
+        # the driver creates CPUFREQ_DIR and the boost knob; load it first
+        try:
+            run(["modprobe", CPUFREQ_MODULE])
+        except OSError as e:
+            print("overclock: modprobe %s failed: %s" % (CPUFREQ_MODULE, e))
+        prev_boost = _cpufreq_read(CPUFREQ_BOOST)
         prev_gov = _cpufreq_read("scaling_governor")
         prev_max = _cpufreq_read("scaling_max_freq")
-        print("overclock: CPU -> 1 GHz, governor -> performance")
+        print("overclock: boost on, CPU -> 1 GHz, governor -> performance")
+        _cpufreq_write(CPUFREQ_BOOST, "1")
         _cpufreq_write("scaling_governor", "performance")
         _cpufreq_write("scaling_max_freq", "1000000")
 
@@ -2467,6 +2841,13 @@ def launch(game, overclock):
             # never leave the governor on performance, even if we could not
             # read the previous value
             _cpufreq_write("scaling_governor", prev_gov or "conservative")
+            # likewise boost: back to what it was, else off
+            _cpufreq_write(CPUFREQ_BOOST, prev_boost or "0")
+        # regenerated on every launch; nothing reads it afterwards
+        try:
+            os.remove(GENERATED_CFG_PATH)
+        except OSError:
+            pass
     if status:
         print("minicast exited with status %d" % status)
     return status
@@ -2501,12 +2882,10 @@ def main():
     detect_parent_mister()
     kill_mister()
     try:
-        game = curses.wrapper(ui)
-        if game is not None:
-            cfg = load_cfg(game_config_path(game) or CFG_PATH)
-            overclock = cfg.get("dreamster", "Overclock",
-                                fallback="0").strip() == "1"
-            return launch(game, overclock)
+        picked = curses.wrapper(ui)
+        if picked is not None:
+            store, game = picked
+            return launch(store, game)
         return 0
     finally:
         restart_mister()

@@ -7,3 +7,6 @@
 [submodule "minicast"]
 	path = minicast
 	url = ../minicast.git
+[submodule "mister-utils"]
+	path = mister-utils
+	url = ../mister-utils.git
