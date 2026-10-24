@@ -182,8 +182,10 @@ class GameDirectoryTests(unittest.TestCase):
                          "/media/fat/games/Dreamcast/dc_boot.bin")
         self.assertEqual(DREAMSTER["FLASH_BIN"],
                          "/media/fat/games/Dreamcast/dc_flash.bin")
-        self.assertEqual(DREAMSTER["CFG_PATH"],
-                         "/media/fat/games/Dreamcast/emu.cfg")
+        self.assertEqual(DREAMSTER["STORE_PATH"],
+                         "/media/fat/config/DreamSTer.CFG")
+        self.assertEqual(DREAMSTER["SAVES_DIR"],
+                         "/media/fat/saves/DreamSTer")
 
 
 if __name__ == "__main__":

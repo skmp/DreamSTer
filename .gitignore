@@ -1,3 +1,5 @@
+agents/
 .claude/
 /dist/
 __pycache__/
+.vscode/
