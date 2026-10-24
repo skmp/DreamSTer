@@ -164,6 +164,7 @@ aica.NoSound = no
 polly2.AutoReset = yes
 polly2.ClockSel = 3
 polly2.DumpOnLockup = no
+polly2.ShowStats = yes
 pvr.FPSTarget = 0
 pvr.ForceGLES2 = no
 pvr.MaxThreads = 3
@@ -491,11 +492,15 @@ CLOCK_OPT = Option("Clock", "polly2.ClockSel",
                    [("0", "75 MHz"), ("1", "90 MHz"), ("2", "100 MHz"),
                     ("3", "112.5 MHz")], "3")
 DUMP_OPT = Option("Store Crash Dump", "polly2.DumpOnLockup", OPT_BOOL, "no")
+# minicast's stats text bar in the top border band
+STATS_OPT = Option("Stats Bar", "polly2.ShowStats",
+                   [("no", "Hide"), ("yes", "Show")], "yes")
 
 # every option Restore Defaults resets; OPTMODE last so the balanced preset
 # is what ends up in the OPT_ITEMS keys
 ALL_OPTIONS = [REGION_OPT, CABLE_OPT, VMU_OPT, OVERCLOCK_OPT, TIMEREC_OPT,
-               AUDIO_OPT, FPS_OPT, AUTORESET_OPT, CLOCK_OPT, DUMP_OPT] \
+               AUDIO_OPT, FPS_OPT, AUTORESET_OPT, CLOCK_OPT, DUMP_OPT,
+               STATS_OPT] \
               + OPT_ITEMS + [OPTMODE_OPT]
 
 
@@ -2460,7 +2465,8 @@ def configure_screen(scr, cfg, subtitle, launch=False):
              ("opt", OPTMODE_OPT)]
     rows += [("opt", o) for o in OPT_ITEMS]
     rows += [("header", "polly2"),
-             ("opt", AUTORESET_OPT), ("opt", CLOCK_OPT), ("opt", DUMP_OPT)]
+             ("opt", AUTORESET_OPT), ("opt", CLOCK_OPT), ("opt", DUMP_OPT),
+             ("opt", STATS_OPT)]
     rows += [("header", "Danger Zone"), ("restore",)]
     selectable = [i for i, r in enumerate(rows) if r[0] != "header"]
     sel = 0  # Launch (pre-launch flow) / Back
